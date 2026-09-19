@@ -57,13 +57,14 @@ io.on('connection', (socket) => {
 
   // WebRTC Signaling
   socket.on('webrtc_signal', (payload) => {
+    // payload: { targetUserId, signal }
     io.to(payload.targetUserId).emit('webrtc_signal', {
       callerId: socket.id,
       signal: payload.signal
     });
   });
 
-  // Video sync events
+  // Video sync events — forward the full data object (includes time + username)
   socket.on('video_play', (data) => {
     if (socket.roomId) socket.to(socket.roomId).emit('video_play', data);
   });
@@ -76,8 +77,9 @@ io.on('connection', (socket) => {
     if (socket.roomId) socket.to(socket.roomId).emit('video_seek', data);
   });
 
-  // Text Chat
+  // Text Chat & System Commands
   socket.on('chat_message', (data) => {
+    // data: { text, username, timestamp } OR { isSystemCommand, command, ... }
     if (socket.roomId) {
       socket.to(socket.roomId).emit('chat_message', {
         ...data,
