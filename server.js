@@ -10,7 +10,6 @@ const RECOVERY_MS = 30_000;
 const PLAYBACK_TTL_SECONDS = 86_400;
 const recoverableReasons = new Set(['transport error', 'transport close', 'ping timeout', 'forced close']);
 const rooms = new Map();
-const pendingLeaves = new Map();
 const pendingLookups = new Map();
 const turnUrls = (process.env.TURN_URLS || '').split(',').map(url => url.trim())
   .filter(url => /^turns?:[^\s]+$/.test(url));
@@ -87,7 +86,7 @@ cleanup.unref();
 const app = express();
 app.use(cors());
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Teleparty Clone Server', activeRooms: rooms.size, turnConfigured });
+  res.json({ status: 'ok', service: 'Teleparty Clone Server', activeRooms: rooms.size, turnConfigured, presenceVersion: 2 });
 });
 
 const server = http.createServer(app);
@@ -111,19 +110,26 @@ function partyChannel(roomId) {
   return `party:${roomId}`;
 }
 
-function removeMember(roomId, userId) {
+function removeMember(roomId, participantKey, socketId) {
   const room = rooms.get(roomId);
-  if (!room?.users.delete(userId)) return;
-  io.to(partyChannel(roomId)).emit('user_left', { userId, totalMembers: room.users.size });
-  if (room.users.size === 0) rooms.delete(roomId);
+  const member = room?.members.get(participantKey);
+  if (member?.socketId !== socketId) return;
+  clearTimeout(member.expiry);
+  room.members.delete(participantKey);
+  io.to(partyChannel(roomId)).emit('user_left', { userId: socketId, totalMembers: room.members.size });
+  if (room.members.size === 0) rooms.delete(roomId);
 }
 
-function leaveRoom(socket) {
+function leaveRoom(socket, participantKey) {
   const roomId = socket.data.roomId;
   if (!roomId) return;
   socket.leave(partyChannel(roomId));
   delete socket.data.roomId;
-  removeMember(roomId, socket.id);
+  removeMember(roomId, participantKey, socket.id);
+}
+
+function memberSocketIds(room) {
+  return room ? [...room.members.values()].map(member => member.socketId) : [];
 }
 
 function validRoomId(roomId) {
@@ -131,14 +137,20 @@ function validRoomId(roomId) {
 }
 
 io.on('connection', socket => {
-  const pendingLeave = pendingLeaves.get(socket.id);
-  if (pendingLeave) {
-    clearTimeout(pendingLeave);
-    pendingLeaves.delete(socket.id);
-  }
-  if (socket.recovered && !rooms.get(socket.data.roomId)?.users.has(socket.id)) {
-    if (socket.data.roomId) socket.leave(partyChannel(socket.data.roomId));
-    delete socket.data.roomId;
+  const { participantToken, instanceId } = socket.handshake.auth || {};
+  const hasIdentity = typeof participantToken === 'string' &&
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(participantToken) &&
+    typeof instanceId === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(instanceId);
+  const participantKey = hasIdentity ? `participant:${participantToken}` : `socket:${socket.id}`;
+  if (socket.recovered && socket.data.roomId) {
+    const member = rooms.get(socket.data.roomId)?.members.get(participantKey);
+    if (member?.socketId === socket.id) {
+      clearTimeout(member.expiry);
+      member.expiry = null;
+    } else {
+      socket.leave(partyChannel(socket.data.roomId));
+      delete socket.data.roomId;
+    }
   }
   let joinAttempt = 0;
 
@@ -150,30 +162,55 @@ io.on('connection', socket => {
     if (!socket.connected || attempt !== joinAttempt) return respond({ error: 'Join superseded.' });
 
     let room = rooms.get(roomId);
-    if (room && !room.users.has(socket.id) && room.users.size >= MAX_MEMBERS) {
+    const previous = room?.members.get(participantKey);
+    if (previous?.retiredInstances.has(instanceId)) {
+      return respond({ code: 'PARTICIPANT_REPLACED', error: 'This party is already open in another tab.' });
+    }
+    if (room && !previous && room.members.size >= MAX_MEMBERS) {
       return respond({ error: 'Room is full! Maximum 5 members allowed.' });
     }
-    if (socket.data.roomId !== roomId) leaveRoom(socket);
+    if (socket.data.roomId !== roomId) leaveRoom(socket, participantKey);
     if (!room) {
-      room = { users: new Set(), playback: saved };
+      room = { members: new Map(), playback: saved };
       rooms.set(roomId, room);
     }
 
-    const alreadyJoined = room.users.has(socket.id);
-    // Keep recovering members in the roster so peers can retain the live call.
-    const existingUsers = [...room.users].filter(id => id !== socket.id);
+    const alreadyJoined = previous?.socketId === socket.id;
+    const replacedId = previous && !alreadyJoined ? previous.socketId : null;
+    clearTimeout(previous?.expiry);
+    const retiredInstances = previous?.retiredInstances || new Set();
+    if (replacedId && previous.instanceId !== instanceId) {
+      retiredInstances.add(previous.instanceId);
+      if (retiredInstances.size > 32) retiredInstances.delete(retiredInstances.values().next().value);
+    }
+    room.members.set(participantKey, { socketId: socket.id, instanceId, retiredInstances, expiry: null });
     socket.join(partyChannel(roomId));
     socket.data.roomId = roomId;
-    room.users.add(socket.id);
-    const totalMembers = room.users.size;
+    const existingUsers = memberSocketIds(room).filter(id => id !== socket.id);
+    const totalMembers = room.members.size;
+    if (replacedId) {
+      const replaced = io.sockets.sockets.get(replacedId);
+      if (replaced) {
+        replaced.leave(partyChannel(roomId));
+        delete replaced.data.roomId;
+        replaced.emit('party_replaced', { roomId });
+        replaced.disconnect();
+      }
+    }
     respond({
-      success: true, roomId, totalMembers, existingUsers,
+      success: true, roomId, totalMembers, existingUsers, resumed: alreadyJoined,
       recoveredState: room.playback,
       turn: getTurnCredentials(socket)
     });
     // A room with just its host also needs a packet offset to resume its session.
     socket.emit('room_ready', roomId);
-    if (!alreadyJoined) socket.to(partyChannel(roomId)).emit('user_joined', { userId: socket.id, totalMembers });
+    const recipients = socket.to(partyChannel(roomId));
+    if (replacedId) {
+      recipients.emit('user_left', { userId: replacedId, totalMembers, reconnecting: true });
+    }
+    if (!alreadyJoined) {
+      recipients.emit('user_joined', { userId: socket.id, totalMembers, reconnecting: Boolean(replacedId) });
+    }
   });
 
   socket.on('get_turn_credentials', callback => {
@@ -184,7 +221,7 @@ io.on('connection', socket => {
     if (typeof callback !== 'function') return;
     if (!validRoomId(roomId)) return callback({ error: 'Invalid room id.' });
     const room = rooms.get(roomId);
-    const hostId = room && [...room.users].find(id => io.sockets.sockets.has(id));
+    const hostId = memberSocketIds(room).find(id => io.sockets.sockets.has(id));
     if (!hostId) return callback({ error: 'Room host is offline. Try again when they reconnect.' });
     finishLookup(socket.id, { error: 'Lookup superseded.' });
     const timeout = setTimeout(() => {
@@ -199,7 +236,7 @@ io.on('connection', socket => {
   socket.on('webrtc_signal', payload => {
     const room = rooms.get(socket.data.roomId);
     const userId = payload?.targetUserId;
-    if (!room?.users.has(userId) || userId === socket.id || !payload.signal) return;
+    if (!memberSocketIds(room).includes(userId) || userId === socket.id || !payload.signal) return;
     io.to(userId).emit('webrtc_signal', { callerId: socket.id, signal: payload.signal, generation: payload.generation });
   });
 
@@ -223,7 +260,7 @@ io.on('connection', socket => {
       if (pendingLookups.get(data.targetId)?.hostId === socket.id && typeof data.url === 'string') {
         finishLookup(data.targetId, { url: data.url });
       }
-      if (socket.data.roomId && rooms.get(socket.data.roomId)?.users.has(data.targetId)) {
+      if (memberSocketIds(rooms.get(socket.data.roomId)).includes(data.targetId)) {
         io.to(data.targetId).emit('chat_message', { ...data, userId: socket.id });
       }
       return;
@@ -237,17 +274,14 @@ io.on('connection', socket => {
   socket.on('disconnect', reason => {
     finishLookup(socket.id);
     const roomId = socket.data.roomId;
-    if (!roomId) return;
+    const member = rooms.get(roomId)?.members.get(participantKey);
+    if (member?.socketId !== socket.id) return;
     if (!recoverableReasons.has(reason)) {
-      removeMember(roomId, socket.id);
+      removeMember(roomId, participantKey, socket.id);
       return;
     }
-    const timer = setTimeout(() => {
-      pendingLeaves.delete(socket.id);
-      removeMember(roomId, socket.id);
-    }, RECOVERY_MS);
-    timer.unref();
-    pendingLeaves.set(socket.id, timer);
+    member.expiry = setTimeout(() => removeMember(roomId, participantKey, socket.id), RECOVERY_MS);
+    member.expiry.unref();
   });
 });
 
