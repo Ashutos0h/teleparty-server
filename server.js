@@ -8,6 +8,7 @@ const Redis = require('ioredis');
 const MAX_MEMBERS = 5;
 const RECOVERY_MS = 30_000;
 const PLAYBACK_TTL_SECONDS = 86_400;
+const PLAYBACK_PROTOCOL = 2;
 const recoverableReasons = new Set(['transport error', 'transport close', 'ping timeout', 'forced close']);
 const rooms = new Map();
 const pendingLookups = new Map();
@@ -86,7 +87,7 @@ cleanup.unref();
 const app = express();
 app.use(cors());
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Teleparty Clone Server', activeRooms: rooms.size, turnConfigured, presenceVersion: 2 });
+  res.json({ status: 'ok', service: 'Teleparty Clone Server', activeRooms: rooms.size, turnConfigured, presenceVersion: 2, playbackProtocol: PLAYBACK_PROTOCOL });
 });
 
 const server = http.createServer(app);
@@ -110,6 +111,66 @@ function partyChannel(roomId) {
   return `party:${roomId}`;
 }
 
+function programmeTime(room, now = Date.now()) {
+  const clock = room.programme;
+  if (!clock) return null;
+  if (clock.paused || room.holding) return clock.time;
+  return clock.time + Math.max(0, now - clock.updatedAt) / 1000;
+}
+
+function programmeState(roomId, room) {
+  return {
+    roomId, sequence: room.sequence, revision: room.revision,
+    time: programmeTime(room), paused: room.programme?.paused ?? true, holding: room.holding,
+    ownerId: room.members.get(room.owner)?.socketId || null
+  };
+}
+
+function sendProgramme(roomId, room, reliable = true) {
+  room.sequence++;
+  const recipients = io.to(partyChannel(roomId));
+  (reliable ? recipients : recipients.volatile).emit('programme_state', programmeState(roomId, room));
+}
+
+function updateProgrammeRoom(roomId, room) {
+  const candidates = [...room.members].filter(([, member]) => !member.expiry);
+  const holding = candidates.some(([, member]) => member.adActive);
+  const eligible = candidates.filter(([, member]) => !member.adActive);
+  const owner = eligible.some(([key]) => key === room.owner) ? room.owner : eligible[0]?.[0] ?? null;
+  if (holding === room.holding && owner === room.owner) return;
+  if (holding !== room.holding && room.programme) {
+    const now = Date.now();
+    room.programme = { time: programmeTime(room, now), paused: room.programme.paused, updatedAt: now };
+  }
+  room.holding = holding;
+  room.owner = owner;
+  room.revision++;
+  sendProgramme(roomId, room);
+}
+
+function validProgrammeTime(time) {
+  return typeof time === 'number' && Number.isFinite(time) && time >= 0 && time <= 86400;
+}
+
+function sampleProgramme(roomId, room, participantKey, { time, paused, revision }) {
+  if (room.holding || room.owner !== participantKey || !validProgrammeTime(time) || typeof paused !== 'boolean') return;
+  if (revision !== undefined && revision !== room.revision) return;
+  const now = Date.now();
+  if (room.programme) {
+    if (paused !== room.programme.paused || Math.abs(time - programmeTime(room, now)) > 1.5) return;
+  }
+  const first = !room.programme;
+  room.programme = { time, paused, updatedAt: now };
+  if (first) sendProgramme(roomId, room);
+}
+
+const programmeHeartbeat = setInterval(() => {
+  for (const [roomId, room] of rooms) {
+    if (room.programme && !room.holding && room.members.size > 1) sendProgramme(roomId, room, false);
+  }
+}, 1000);
+programmeHeartbeat.unref();
+
 function removeMember(roomId, participantKey, socketId) {
   const room = rooms.get(roomId);
   const member = room?.members.get(participantKey);
@@ -118,6 +179,7 @@ function removeMember(roomId, participantKey, socketId) {
   room.members.delete(participantKey);
   io.to(partyChannel(roomId)).emit('user_left', { userId: socketId, totalMembers: room.members.size });
   if (room.members.size === 0) rooms.delete(roomId);
+  else updateProgrammeRoom(roomId, room);
 }
 
 function leaveRoom(socket, participantKey) {
@@ -147,6 +209,7 @@ io.on('connection', socket => {
     if (member?.socketId === socket.id) {
       clearTimeout(member.expiry);
       member.expiry = null;
+      updateProgrammeRoom(socket.data.roomId, rooms.get(socket.data.roomId));
     } else {
       socket.leave(partyChannel(socket.data.roomId));
       delete socket.data.roomId;
@@ -171,7 +234,10 @@ io.on('connection', socket => {
     }
     if (socket.data.roomId !== roomId) leaveRoom(socket, participantKey);
     if (!room) {
-      room = { members: new Map(), playback: saved };
+      room = {
+        members: new Map(), playback: saved, programme: null,
+        owner: null, holding: false, revision: 0, sequence: 0
+      };
       rooms.set(roomId, room);
     }
 
@@ -183,11 +249,15 @@ io.on('connection', socket => {
       retiredInstances.add(previous.instanceId);
       if (retiredInstances.size > 32) retiredInstances.delete(retiredInstances.values().next().value);
     }
-    room.members.set(participantKey, { socketId: socket.id, instanceId, retiredInstances, expiry: null });
+    room.members.set(participantKey, {
+      socketId: socket.id, instanceId, retiredInstances, expiry: null,
+      adActive: previous?.adActive ?? false
+    });
     socket.join(partyChannel(roomId));
     socket.data.roomId = roomId;
     const existingUsers = memberSocketIds(room).filter(id => id !== socket.id);
     const totalMembers = room.members.size;
+    updateProgrammeRoom(roomId, room);
     if (replacedId) {
       const replaced = io.sockets.sockets.get(replacedId);
       if (replaced) {
@@ -200,17 +270,20 @@ io.on('connection', socket => {
     respond({
       success: true, roomId, totalMembers, existingUsers, resumed: alreadyJoined,
       recoveredState: room.playback,
+      playbackProtocol: PLAYBACK_PROTOCOL,
+      programme: programmeState(roomId, room),
       turn: getTurnCredentials(socket)
     });
     // A room with just its host also needs a packet offset to resume its session.
     socket.emit('room_ready', roomId);
     const recipients = socket.to(partyChannel(roomId));
     if (replacedId) {
-      recipients.emit('user_left', { userId: replacedId, totalMembers, reconnecting: true });
+      recipients.emit('user_left', { userId: replacedId, replacementId: socket.id, totalMembers, reconnecting: true });
     }
     if (!alreadyJoined) {
       recipients.emit('user_joined', { userId: socket.id, totalMembers, reconnecting: Boolean(replacedId) });
     }
+    if (replacedId && room.owner === participantKey) sendProgramme(roomId, room);
   });
 
   socket.on('get_turn_credentials', callback => {
@@ -240,12 +313,34 @@ io.on('connection', socket => {
     io.to(userId).emit('webrtc_signal', { callerId: socket.id, signal: payload.signal, generation: payload.generation });
   });
 
+  socket.on('programme_ad', active => {
+    if (typeof active !== 'boolean') return;
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    const member = room?.members.get(participantKey);
+    if (member?.socketId !== socket.id || member.adActive === active) return;
+    member.adActive = active;
+    updateProgrammeRoom(roomId, room);
+  });
+
+  socket.on('programme_sample', data => {
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    if (!room || !data || !Number.isSafeInteger(data.revision)) return;
+    sampleProgramme(roomId, room, participantKey, data);
+  });
+
   for (const event of ['video_play', 'video_pause', 'video_seek']) {
     socket.on(event, data => {
       const roomId = socket.data.roomId;
-      if (!roomId || !data || data.heartbeat) return;
+      const room = rooms.get(roomId);
+      if (!room || !data || data.heartbeat || !validProgrammeTime(data.time) || room.holding) return;
+      const paused = event === 'video_pause' || (event === 'video_seek' && data.paused === true);
+      room.owner = participantKey;
+      room.programme = { time: data.time, paused, updatedAt: Date.now() };
+      room.revision++;
+      sendProgramme(roomId, room);
       socket.to(partyChannel(roomId)).emit(event, data);
-      const paused = event === 'video_pause' || (event === 'video_seek' && data.paused);
       savePlayback(roomId, paused ? 'paused' : 'playing', Number(data.time));
     });
   }
@@ -267,7 +362,11 @@ io.on('connection', socket => {
     }
     if (!socket.data.roomId) return;
     let recipients = socket.to(partyChannel(socket.data.roomId));
-    if (data.isSystemCommand && data.command === 'VIDEO_SYNC') recipients = recipients.volatile;
+    if (data.isSystemCommand && data.command === 'VIDEO_SYNC') {
+      const room = rooms.get(socket.data.roomId);
+      if (room) sampleProgramme(socket.data.roomId, room, participantKey, data);
+      recipients = recipients.volatile;
+    }
     recipients.emit('chat_message', { ...data, userId: socket.id });
   });
 
@@ -282,6 +381,7 @@ io.on('connection', socket => {
     }
     member.expiry = setTimeout(() => removeMember(roomId, participantKey, socket.id), RECOVERY_MS);
     member.expiry.unref();
+    updateProgrammeRoom(roomId, rooms.get(roomId));
   });
 });
 
